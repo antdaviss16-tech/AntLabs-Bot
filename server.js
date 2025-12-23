@@ -1,5 +1,6 @@
 const express = require('express');
 const twilio = require('twilio');
+const OpenAI = require('openai');
 require('dotenv').config();
 
 const app = express();
@@ -9,6 +10,10 @@ const client = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
 // Clinic data
 const CLINIC = {
@@ -23,60 +28,54 @@ const CLINIC = {
 // Simple conversation state (in-memory)
 const conversations = {};
 
-function getResponse(phoneNumber, message) {
+async function getAIResponse(phoneNumber, message) {
   if (!conversations[phoneNumber]) {
-    conversations[phoneNumber] = { stage: 'start' };
+    conversations[phoneNumber] = { history: [] };
   }
 
   const state = conversations[phoneNumber];
-  const msg = message.toLowerCase().trim();
+  
+  // Build conversation history
+  state.history.push({ role: 'user', content: message });
 
-  // Stage 1: Initial greeting
-  if (state.stage === 'start') {
-    state.stage = 'treatment_choice';
-    return `Hi! 👋 Welcome to ${CLINIC.name}.\n\nWhat treatment are you interested in?\n\n${CLINIC.treatments
-      .map((t) => `${t.id}. ${t.name} - ${t.price.toLocaleString()} IDR (${t.duration}min)`)
-      .join('\n')}`;
+  const systemPrompt = `You are a helpful assistant for ${CLINIC.name}. 
+Available treatments:
+${CLINIC.treatments.map(t => `- ${t.name}: ${t.price.toLocaleString()} IDR (${t.duration} min)`).join('\n')}
+
+Available slots:
+- Dec 13: 10:00 AM, 2:00 PM
+- Dec 14: 10:00 AM, 3:00 PM
+- Dec 15: 11:00 AM
+
+Help customers book appointments. Be friendly and professional.`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages: [
+        { role: "system", content: systemPrompt },
+        ...state.history
+      ]
+    });
+
+    const aiResponse = completion.choices[0].message.content;
+    state.history.push({ role: 'assistant', content: aiResponse });
+
+    return aiResponse;
+  } catch (error) {
+    console.error('OpenAI Error:', error);
+    return 'Sorry, I encountered an error. Please try again.';
   }
-
-  // Stage 2: Treatment selected
-  if (state.stage === 'treatment_choice') {
-    const treatmentId = parseInt(msg);
-    const selected = CLINIC.treatments.find((t) => t.id === treatmentId);
-
-    if (selected) {
-      state.stage = 'slot_choice';
-      state.selectedTreatment = selected;
-      return `Great! You chose ${selected.name}.\n\nAvailable slots:\n1. Dec 13 - 10:00 AM\n2. Dec 13 - 2:00 PM\n3. Dec 14 - 10:00 AM\n4. Dec 14 - 3:00 PM\n5. Dec 15 - 11:00 AM\n\nWhich slot? (reply with 1-5)`;
-    }
-    return `Sorry, please reply with 1, 2, or 3.`;
-  }
-
-  // Stage 3: Appointment confirmed
-  if (state.stage === 'slot_choice') {
-    const slotId = parseInt(msg);
-    if (slotId >= 1 && slotId <= 5) {
-      const slots = ['Dec 13 - 10:00 AM', 'Dec 13 - 2:00 PM', 'Dec 14 - 10:00 AM', 'Dec 14 - 3:00 PM', 'Dec 15 - 11:00 AM'];
-      const selectedSlot = slots[slotId - 1];
-      state.stage = 'completed';
-
-      return `✓ BOOKING CONFIRMED!\n\n📋 Treatment: ${state.selectedTreatment.name}\n⏰ When: ${selectedSlot}\n📍 Where: ${CLINIC.name}\n💰 Cost: ${state.selectedTreatment.price.toLocaleString()} IDR\n\nYou'll get reminders 24hr before.\nPayment at clinic.\nSee you soon! 😊`;
-    }
-    return `Sorry, please reply with 1, 2, 3, 4, or 5.`;
-  }
-
-  return `How can I help you?`;
 }
 
 // Webhook: Receive WhatsApp messages
 app.post('/whatsapp', async (req, res) => {
   const incomingMessage = req.body.Body;
   const senderNumber = req.body.From;
-
   console.log(`📱 Message from ${senderNumber}: ${incomingMessage}`);
 
-  // Generate response
-  const response = getResponse(senderNumber, incomingMessage);
+  // Generate AI response
+  const response = await getAIResponse(senderNumber, incomingMessage);
 
   // Send response back
   try {
